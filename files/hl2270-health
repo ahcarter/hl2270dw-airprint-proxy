@@ -1,0 +1,53 @@
+#!/bin/bash
+# hl2270-health -- keep the AirPrint proxy alive. Run every 2 minutes by hl2270-health.timer.
+# Silent when healthy; every repair is logged to the journal under tag hl2270-health.
+set -u
+# shellcheck source=/dev/null
+. /etc/hl2270-proxy.conf
+Q=${QUEUE:-HL2270DW}
+STAMP=/run/hl2270-health.last-cups-restart
+log() { logger -t hl2270-health "$*"; }
+export LC_ALL=C
+
+restart_cups() {
+    # At most one cupsd restart per 30 minutes, so a persistent fault cannot flap the queue.
+    if [ -f "$STAMP" ] && [ $(( $(date +%s) - $(stat -c %Y "$STAMP") )) -lt 1800 ]; then
+        log "cupsd restart wanted ($1) but throttled"
+        return
+    fi
+    touch "$STAMP"
+    log "restarting cupsd: $1"
+    systemctl restart cups
+    sleep 5
+}
+
+# 1. cupsd answers.
+if ! timeout 20 lpstat -r 2>/dev/null | grep -q 'is running'; then
+    restart_cups "scheduler not answering"
+fi
+
+# 2. Queue exists, is enabled, and accepts jobs.
+if ! timeout 20 lpstat -p "$Q" >/dev/null 2>&1; then
+    log "queue $Q missing; recreating"
+    /usr/local/sbin/hl2270-setup-queue 2>&1 | logger -t hl2270-health
+fi
+if timeout 20 lpstat -p "$Q" 2>/dev/null | grep -q 'disabled'; then
+    log "queue $Q disabled; enabling ($(lpstat -p "$Q" 2>&1 | tr '\n' ' '))"
+    cupsenable "$Q"
+fi
+if timeout 20 lpstat -a "$Q" 2>/dev/null | grep -q 'not accepting'; then
+    log "queue $Q rejecting jobs; accepting"
+    cupsaccept "$Q"
+fi
+
+# 3. The AirPrint (Bonjour) advertisement is visible on the LAN side of avahi.
+advertised() {
+    timeout 15 avahi-browse -t -r -p _ipp._tcp 2>/dev/null | grep -q "rp=printers/$Q"
+}
+if ! advertised; then
+    log "AirPrint advertisement for $Q missing; restarting avahi-daemon"
+    systemctl restart avahi-daemon
+    sleep 10
+    advertised || restart_cups "advertisement still missing after avahi restart"
+fi
+exit 0

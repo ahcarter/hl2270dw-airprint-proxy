@@ -1,0 +1,8 @@
+[Unit]
+Description=HL-2270DW AirPrint proxy health check
+After=cups.service avahi-daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hl2270-health
+TimeoutStartSec=180

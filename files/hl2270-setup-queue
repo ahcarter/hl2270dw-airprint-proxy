@@ -1,0 +1,35 @@
+#!/bin/bash
+# hl2270-setup-queue -- create or repair the shared AirPrint queue. Idempotent.
+# Called by install.sh, and by hl2270-health if the queue ever disappears.
+set -euo pipefail
+# shellcheck source=/dev/null
+. /etc/hl2270-proxy.conf
+
+uri="bripp://$PRINTER_HOST:$PRINTER_PORT$PRINTER_PATH"
+
+ppd=${DRIVER_PPD:-}
+if [ -z "$ppd" ]; then
+    # lpinfo returns nothing while cupsd is restarting (e.g. right after cupsctl); retry.
+    models=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        models=$(lpinfo -m 2>/dev/null || true)
+        [ -n "$models" ] && break
+        sleep 3
+    done
+    ppd=$(awk 'tolower($0) ~ /brlaser/ && tolower($0) ~ /hl-2270dw/ {print $1; exit}' <<<"$models")
+    if [ -z "$ppd" ]; then
+        ppd=$(awk '$1 ~ /generpcl\.ppd$/ {print $1; exit}' <<<"$models")
+        echo "warning: brlaser HL-2270DW model not found; falling back to '${ppd:-none}'" >&2
+    fi
+fi
+[ -n "$ppd" ] || { echo "error: no usable driver (lpinfo -m found neither brlaser nor generpcl)" >&2; exit 1; }
+
+lpadmin -p "$QUEUE" -E -v "$uri" -m "$ppd" \
+    -D "$QUEUE_INFO" -L "$QUEUE_LOCATION" \
+    -o printer-is-shared=true \
+    -o printer-error-policy=retry-job \
+    -o PageSize="$PAGE_SIZE" 2> >(grep -v -i 'deprecated' >&2)
+cupsenable "$QUEUE"
+cupsaccept "$QUEUE"
+lpadmin -d "$QUEUE"
+echo "queue $QUEUE -> $uri ($ppd)"

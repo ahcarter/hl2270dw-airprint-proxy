@@ -1,0 +1,169 @@
+#!/usr/bin/python3
+"""bripp -- CUPS backend for the Brother HL-2270DW's IPP/1.0 server.
+
+Why it exists: the printer's raw ports (9100, 515) may be closed, and its IPP server
+speaks only IPP/1.0 over HTTP/1.0 and rejects every document-format except
+application/vnd.hp-PCL. ipptool marks any HTTP/1.0 reply as a failure (which would
+make CUPS reprint a successful job), and the stock ipp backend may label driver output
+application/octet-stream, which the printer refuses. This backend sends the finished
+driver output as one IPP/1.0 Print-Job with Content-Length, labeled PCL, and judges
+success only by the IPP status code.
+
+URI:   bripp://HOST[:PORT]/PATH        e.g. bripp://printer.lan:631/binary_p1
+Extra: FALLBACK_HOSTS in /etc/hl2270-proxy.conf are tried when HOST does not connect.
+Probe: DEVICE_URI=... bripp --probe   (Validate-Job only; prints nothing on paper)
+Exit codes per backend(7): 0 sent, 1 failed, 5 cancel this job, 6 retry job later.
+"""
+import http.client
+import os
+import shutil
+import socket
+import struct
+import sys
+import tempfile
+from urllib.parse import urlsplit
+
+OK, FAILED, CANCEL, RETRY = 0, 1, 5, 6
+PRINT_JOB, VALIDATE_JOB = 0x0002, 0x0004
+IO_TIMEOUT = 600  # seconds one socket operation may stall (paper out, warm-up) before retry
+
+
+def log(level, msg):
+    sys.stderr.write(f"{level}: {msg}\n")
+    sys.stderr.flush()
+
+
+def read_conf(path="/etc/hl2270-proxy.conf"):
+    conf = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, val = line.split("=", 1)
+                    conf[key.strip()] = val.strip().strip("\"'")
+    except OSError:
+        pass
+    return conf
+
+
+def ipp_attr(tag, name, value):
+    n, v = name.encode(), value.encode()
+    return bytes([tag]) + struct.pack(">H", len(n)) + n + struct.pack(">H", len(v)) + v
+
+
+def ipp_request(op, uri):
+    return (struct.pack(">BBHI", 1, 0, op, 1) + b"\x01"
+            + ipp_attr(0x47, "attributes-charset", "utf-8")
+            + ipp_attr(0x48, "attributes-natural-language", "en")
+            + ipp_attr(0x45, "printer-uri", uri)
+            + ipp_attr(0x42, "requesting-user-name", "hl2270-proxy")
+            + ipp_attr(0x49, "document-format", "application/vnd.hp-PCL")
+            + b"\x03")
+
+
+def post(host, port, path, op, fh=None, size=0):
+    """Send one IPP request; return the IPP status code. Raises OSError/HTTPException."""
+    body = ipp_request(op, f"ipp://{host}:{port}{path}")
+    conn = http.client.HTTPConnection(host, port, timeout=IO_TIMEOUT)
+    try:
+        conn.putrequest("POST", path, skip_accept_encoding=True)
+        conn.putheader("Content-Type", "application/ipp")
+        conn.putheader("Content-Length", str(len(body) + size))
+        conn.endheaders()
+        conn.send(body)
+        if fh is not None:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        resp = conn.getresponse()
+        data = resp.read()
+    finally:
+        conn.close()
+    if resp.status != 200 or len(data) < 8:
+        raise http.client.HTTPException(f"HTTP {resp.status}, {len(data)} bytes")
+    return struct.unpack(">H", data[2:4])[0]
+
+
+def pick_host(hosts, port):
+    """First host that accepts a TCP connection. Fallbacks apply only before any data is sent."""
+    for host in hosts:
+        try:
+            socket.create_connection((host, port), timeout=5).close()
+            return host
+        except OSError as exc:
+            log("DEBUG", f"{host}:{port} not reachable: {exc}")
+    return None
+
+
+def main(argv):
+    if len(argv) == 1:
+        print('network bripp "Unknown" "Brother IPP/1.0 raw (hl2270-proxy)"')
+        return OK
+    probe = argv[1] == "--probe"
+    if not probe and len(argv) not in (6, 7):
+        log("ERROR", "usage: bripp job-id user title copies options [file]")
+        return FAILED
+
+    uri = urlsplit(os.environ.get("DEVICE_URI", ""))
+    if uri.scheme != "bripp" or not uri.hostname or not uri.path:
+        log("ERROR", f"bad DEVICE_URI {os.environ.get('DEVICE_URI')!r}")
+        return FAILED
+    port = uri.port or 631
+    conf = read_conf()
+    hosts = [uri.hostname] + [h for h in conf.get("FALLBACK_HOSTS", "").split() if h != uri.hostname]
+
+    host = pick_host(hosts, port)
+    if host is None:
+        log("INFO", "Printer not reachable; will retry")
+        log("STATE", "+connecting-to-device")
+        return RETRY
+    log("STATE", "-connecting-to-device")
+
+    if probe:
+        try:
+            status = post(host, port, uri.path, VALIDATE_JOB)
+        except (OSError, http.client.HTTPException) as exc:
+            print(f"probe {host}: transport error: {exc}")
+            return RETRY
+        print(f"probe {host}:{port}{uri.path}: Validate-Job status 0x{status:04x}")
+        return OK if status < 0x0100 else FAILED
+
+    tmp = None
+    try:
+        if len(argv) == 7:
+            path, copies = argv[6], max(1, int(argv[4]) if argv[4].isdigit() else 1)
+        else:
+            fd, tmp = tempfile.mkstemp(prefix="bripp.", dir=os.environ.get("TMPDIR"))
+            with os.fdopen(fd, "wb") as out:
+                shutil.copyfileobj(sys.stdin.buffer, out, 1 << 20)
+            path, copies = tmp, 1  # filtered jobs: the filters already made the copies
+        size = os.path.getsize(path)
+        if size == 0:
+            log("INFO", "Empty job; nothing to send")
+            return OK
+        for copy in range(1, copies + 1):
+            log("INFO", f"Sending {size} bytes to {host} (copy {copy} of {copies})")
+            try:
+                with open(path, "rb") as fh:
+                    status = post(host, port, uri.path, PRINT_JOB, fh, size)
+            except (OSError, http.client.HTTPException) as exc:
+                log("INFO", f"Send to {host} failed ({exc}); will retry")
+                return RETRY
+            if status >= 0x0400 and status < 0x0500:
+                log("ERROR", f"Printer rejected the job (IPP status 0x{status:04x}); cancelling")
+                return CANCEL
+            if status >= 0x0100:
+                log("INFO", f"Printer busy or erroring (IPP status 0x{status:04x}); will retry")
+                return RETRY
+        log("INFO", f"Job sent to {host}")
+        return OK
+    finally:
+        if tmp:
+            os.unlink(tmp)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
