@@ -28,7 +28,8 @@ lpadmin -p "$QUEUE" -E -v "$uri" -m "$ppd" \
     -D "$QUEUE_INFO" -L "$QUEUE_LOCATION" \
     -o printer-is-shared=true \
     -o printer-error-policy=retry-job \
-    -o PageSize="$PAGE_SIZE" 2> >(grep -v -i 'deprecated' >&2)
+    -o PageSize="$PAGE_SIZE" \
+    -o Resolution="${RESOLUTION:-1200dpi}" 2> >(grep -v -i 'deprecated' >&2)
 cupsenable "$QUEUE"
 cupsaccept "$QUEUE"
 lpadmin -d "$QUEUE"

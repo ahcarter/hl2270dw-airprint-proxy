@@ -44,11 +44,21 @@ fi
 step "2/6 Packages (no recommends: no cups-browsed, no colord, no extra drivers)"
 export DEBIAN_FRONTEND=noninteractive
 PKGS="cups cups-ipp-utils printer-driver-brlaser avahi-daemon avahi-utils libnss-mdns iw"
-for try in 1 2 3; do
-    apt-get update -qq && apt-get install -y -qq --no-install-recommends $PKGS && break
-    [ $try -eq 3 ] && { echo "apt failed 3 times" >&2; exit 1; }
-    sleep 20
+# apt-get update pushes a 1 GB Pi ~250 MB into swap; on a busy Pi that can starve systemd
+# long enough for the hardware watchdog to reboot it. So touch apt only when something is missing.
+missing=""
+for p in $PKGS; do
+    [ "$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null)" = "install ok installed" ] || missing="$missing $p"
 done
+if [ -n "$missing" ]; then
+    for try in 1 2 3; do
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends $missing && break
+        [ $try -eq 3 ] && { echo "apt failed 3 times" >&2; exit 1; }
+        sleep 20
+    done
+else
+    echo "packages already installed; apt not run"
+fi
 if systemctl list-unit-files cups-browsed.service >/dev/null 2>&1 &&
    systemctl is-enabled -q cups-browsed 2>/dev/null; then
     # cups-browsed creates and deletes queues on its own; a print server does not want that.
@@ -72,17 +82,24 @@ step "4/6 CUPS: share over AirPrint, LAN only, retry instead of stopping the que
 [ -e /etc/cups/cupsd.conf.pre-hl2270 ] || cp -p /etc/cups/cupsd.conf /etc/cups/cupsd.conf.pre-hl2270
 systemctl enable -q --now avahi-daemon cups
 for i in $(seq 1 30); do lpstat -r >/dev/null 2>&1 && break; sleep 1; done
+# The iPhone lays pages out for the paper the printer reports as loaded (media-ready), not
+# the queue default. CUPS derives that list from the Pi's locale, which on a UK-English
+# install means A4, A3, A5... So pin it to the paper actually in the tray.
+PAPER=$(. "$CONF"; echo "${PAGE_SIZE:-Letter}")
+case $PAPER in *[!A-Za-z0-9.]*) echo "invalid PAGE_SIZE: $PAPER" >&2; exit 1 ;; esac
 # Any cupsctl write makes cupsd exit and be restarted by systemd, which would interrupt a
 # job mid-print. So write only when a setting differs; a re-run on a healthy Pi changes nothing.
 WANT="_share_printers=1 _remote_admin=0 _remote_any=0 _user_cancel_any=0
-      ErrorPolicy=retry-job JobRetryInterval=30 JobRetryLimit=60"
+      ErrorPolicy=retry-job JobRetryInterval=30 JobRetryLimit=60
+      DefaultPaperSize=$PAPER ReadyPaperSizes=$PAPER"
 have=$(cupsctl 2>/dev/null || true)
 stale=""
 for kv in $WANT; do grep -qxF "$kv" <<<"$have" || stale="$stale $kv"; done
 if [ -n "$stale" ]; then
     echo "updating CUPS settings:$stale"
     cupsctl --share-printers --no-remote-admin --no-remote-any --no-user-cancel-any \
-        ErrorPolicy=retry-job JobRetryInterval=30 JobRetryLimit=60
+        ErrorPolicy=retry-job JobRetryInterval=30 JobRetryLimit=60 \
+        DefaultPaperSize="$PAPER" ReadyPaperSizes="$PAPER"
     sleep 5   # cupsctl restarts cupsd asynchronously; let the old process exit first
     for i in $(seq 1 30); do lpstat -r >/dev/null 2>&1 && break; sleep 1; done
 else
@@ -128,6 +145,12 @@ check "advertises Apple raster (URF)"      "grep -q 'urf-supported' <<<\"\$attrs
 check "accepts image/urf and PDF"          "grep 'document-format-supported' <<<\"\$attrs\" | grep -q 'image/urf' && grep 'document-format-supported' <<<\"\$attrs\" | grep -q 'application/pdf'"
 check "URF converts to printer format"     "cupsfilter -e --list-filters -p /etc/cups/ppd/$Q.ppd -m printer/foo -i image/urf /dev/null >/dev/null 2>&1"
 check "PDF renders through the driver"     "cupsfilter -e -p /etc/cups/ppd/$Q.ppd -m printer/foo /usr/share/cups/data/default-testpage.pdf 2>/dev/null | head -c 256 | grep -aq '@PJL'"
+RES=$(. /etc/hl2270-proxy.conf; echo "${RESOLUTION:-1200dpi}")
+check "default resolution is $RES"         "grep -q '^\*DefaultResolution: $RES' /etc/cups/ppd/$Q.ppd"
+# What the iPhone lays out for: exactly one loaded paper, and it is the queue default.
+mdef=$(sed -n 's/^[[:space:]]*media-default (keyword) = //p' <<<"$attrs")
+ready_is_default() { [ -n "$mdef" ] && grep -qxE "[[:space:]]*media-ready \(keyword\) = $mdef" <<<"$attrs"; }
+check "iPhone sees ${mdef:-?} loaded, nothing else" ready_is_default
 # Bonjour registration can lag queue creation by several seconds; poll up to 30 s.
 browse() { for _ in 1 2 3 4 5 6; do timeout 10 avahi-browse -t -r -p "$1" 2>/dev/null | grep -q "$2" && return 0; sleep 5; done; return 1; }
 check "Bonjour _ipp._tcp advertisement"    "browse _ipp._tcp 'rp=printers/$Q'"

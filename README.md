@@ -2,7 +2,7 @@
 
 Make a Brother HL-2270DW print from an iPhone or iPad. A Raspberry Pi on the same network advertises the printer
 over AirPrint, renders each job with the open-source `brlaser` driver, and forwards it to the printer. Install is
-one command, re-running it repairs everything, and a 13-point self-test proves the path works without using paper.
+one command, re-running it repairs everything, and a 15-point self-test proves the path works without using paper.
 
 Verified on a Raspberry Pi 3B+ running Debian 13 (trixie): an iOS two-sided PDF job printed, a LAN test page
 printed, and the proxy came back from a cold reboot with nothing to repair.
@@ -16,6 +16,17 @@ iPhone --AirPrint (Bonjour + IPP, PDF or Apple raster)--> Pi: CUPS --brlaser--> 
 The Pi runs stock CUPS with Avahi. CUPS advertises one shared queue with the AirPrint subtype and the `URF` key,
 renders each job with `brlaser` (exact HL-2270DW model, duplex supported), and hands the result to `bripp`, a
 small Python CUPS backend.
+
+Jobs print at the printer's best mode by default: brlaser's "1200HQ" renders at 1200×1200 and switches the
+printer to HQ1200 (Brother's "up to 2400 × 600 dpi" class; the engine itself is 600 dpi). It needs no extra memory
+(peak 30–34 MB at either setting on a Pi 3B+), but image-heavy pages render about 3× slower than at 600 dpi, about
+4.5 s per page. Set `RESOLUTION=600dpi` in `/etc/hl2270-proxy.conf` and run `sudo hl2270-setup-queue` to trade
+quality for speed.
+
+The iPhone lays each page out for the paper the printer reports as loaded, not for the queue's default size. CUPS
+builds that report from the Pi's locale, and a UK-English install (the Raspberry Pi default) reports A4, A3 and
+A5, so a US iPhone would format pages for A4 and print them on Letter. The installer pins both the default and the
+loaded paper to `PAGE_SIZE` (Letter unless you change it); other sizes remain selectable per job.
 
 The custom backend exists because the printer defeats every stock CUPS path. Its IPP server speaks only IPP/1.0,
 answers in HTTP/1.0, and rejects every document-format except `application/vnd.hp-PCL`; its raw ports, 9100 and
